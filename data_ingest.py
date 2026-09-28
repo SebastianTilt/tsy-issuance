@@ -12,12 +12,9 @@ from typing import Optional, List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
-import warnings
 import time
 
 from config import CONFIG
-
-warnings.filterwarnings('ignore')
 
 
 class DataFetcher:
@@ -91,28 +88,35 @@ class DataFetcher:
             'format': 'json'
         }
         
-        all_rows = []
+        return pd.DataFrame(self._fetch_all_pages(CONFIG.mspd_base_url, params))
+    
+    def _fetch_all_pages(self, url: str, params: Dict[str, Any]) -> List[Dict]:
+        """
+        Fetch every page of a Fiscal Data query, using meta['total-pages'].
+        
+        Any failed page raises (after retries) instead of returning partial
+        data, so an incomplete history is never cached or saved.
+        """
+        params = dict(params)
+        all_rows: List[Dict] = []
         page = 1
+        total_pages = 1
         
-        while True:
+        while page <= total_pages:
             params['page[number]'] = str(page)
-            
-            try:
-                data = self._fetch_with_retry(CONFIG.mspd_base_url, params)
-                rows = data.get('data', [])
-                
-                if not rows:
-                    break
-                    
-                all_rows.extend(rows)
-                print(f"    Page {page}: {len(rows)} records (total: {len(all_rows):,})")
-                page += 1
-                
-            except Exception as e:
-                print(f"    Error on page {page}: {e}")
-                break
+            data = self._fetch_with_retry(url, params)
+            total_pages = int(data['meta']['total-pages'])
+            rows = data.get('data', [])
+            all_rows.extend(rows)
+            print(f"    Page {page}/{total_pages}: {len(rows)} records (total: {len(all_rows):,})")
+            page += 1
         
-        return pd.DataFrame(all_rows)
+        expected = int(data['meta']['total-count'])
+        if len(all_rows) != expected:
+            raise RuntimeError(
+                f"Fetched {len(all_rows):,} rows but the API reported {expected:,}"
+            )
+        return all_rows
     
     def fetch_mspd_full_history(self) -> pd.DataFrame:
         """Fetch complete MSPD history using parallel requests"""
@@ -138,13 +142,12 @@ class DataFetcher:
             
             for future in as_completed(futures):
                 start, end = futures[future]
-                try:
-                    df = future.result()
-                    if not df.empty:
-                        dfs.append(df)
-                        print(f"  Completed: {start} -> {end or 'latest'}: {len(df):,} records")
-                except Exception as e:
-                    print(f"  Failed: {start} -> {end or 'latest'}: {e}")
+                # Let failures propagate: a missing date range must not be
+                # cached or saved as if it were the full history.
+                df = future.result()
+                if not df.empty:
+                    dfs.append(df)
+                print(f"  Completed: {start} -> {end or 'latest'}: {len(df):,} records")
         
         if not dfs:
             raise RuntimeError("No MSPD data fetched from API")
@@ -183,34 +186,7 @@ class DataFetcher:
             'format': 'json'
         }
         
-        all_rows = []
-        page = 1
-        max_pages = 10
-        
-        while page <= max_pages:
-            params['page[number]'] = str(page)
-            
-            try:
-                data = self._fetch_with_retry(CONFIG.tga_base_url, params)
-                rows = data.get('data', [])
-                
-                if not rows:
-                    break
-                    
-                all_rows.extend(rows)
-                print(f"  Page {page}: {len(rows)} records")
-                
-                if len(rows) < CONFIG.page_size:
-                    break
-                page += 1
-                
-            except Exception as e:
-                print(f"  Error on page {page}: {e}")
-                if page == 1:
-                    raise
-                break
-        
-        df = pd.DataFrame(all_rows)
+        df = pd.DataFrame(self._fetch_all_pages(CONFIG.tga_base_url, params))
         
         if df.empty:
             raise ValueError("No TGA data fetched")
