@@ -14,6 +14,21 @@ from pathlib import Path
 
 from config import CONFIG, get_bucket_order, get_tenor_order, format_currency
 
+# Readable legend names for MSPD security_class1_desc values
+INSTRUMENT_LABELS = {
+    'Bills Maturity Value': 'Bills',
+    'Notes': 'Notes',
+    'Bonds': 'Bonds',
+    'Inflation-Protected Securities': 'TIPS',
+    'Floating Rate Notes': 'FRNs',
+}
+
+
+def _label_instruments(pivot: pd.DataFrame) -> pd.DataFrame:
+    """Rename instrument-group columns to their display names"""
+    return pivot.rename(columns=INSTRUMENT_LABELS)
+
+
 # Caveat for charts built on gross issuance, which misses intramonth bills
 BILL_ISSUANCE_CAVEAT = (
     "Month-end MSPD snapshots miss bills issued and matured within the same month "
@@ -71,7 +86,7 @@ class ChartGenerator:
         """Chart A: Outstanding by instrument group"""
         print("Creating Chart A: Instrument composition...")
         
-        pivot = self.analytics.compute_composition_by_instrument()
+        pivot = _label_instruments(self.analytics.compute_composition_by_instrument())
         
         # A1: Absolute
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
@@ -79,7 +94,7 @@ class ChartGenerator:
         ax.set_title('Outstanding Treasury Securities by Instrument Group', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Outstanding Par (USD)')
+        ax.set_ylabel('Par outstanding')
         ax.legend(title='Instrument Group', bbox_to_anchor=(1.05, 1), loc='upper left')
         self._format_yaxis_currency(ax, 'T')
         plt.tight_layout()
@@ -92,7 +107,7 @@ class ChartGenerator:
         ax.set_title('Outstanding Treasury Securities by Instrument Group (% of Total)', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Percentage of Total')
+        ax.set_ylabel('Share of par outstanding')
         ax.legend(title='Instrument Group', bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
         plt.tight_layout()
@@ -110,7 +125,7 @@ class ChartGenerator:
         ax.set_title('Outstanding Treasury Securities by Maturity Bucket', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Outstanding Par (USD)')
+        ax.set_ylabel('Par outstanding')
         ax.legend(title='Maturity Bucket', bbox_to_anchor=(1.05, 1), loc='upper left')
         self._format_yaxis_currency(ax, 'T')
         plt.tight_layout()
@@ -123,7 +138,7 @@ class ChartGenerator:
         ax.set_title('Outstanding Treasury Securities by Maturity Bucket (% of Total)', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Percentage of Total')
+        ax.set_ylabel('Share of par outstanding')
         ax.legend(title='Maturity Bucket', bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
         plt.tight_layout()
@@ -138,7 +153,7 @@ class ChartGenerator:
         print("Creating Chart C: Weighted Average Maturity...")
         
         metrics = self.analytics.compute_metrics_timeseries()
-        wam_by_group = self.analytics.compute_wam_by_group()
+        wam_by_group = _label_instruments(self.analytics.compute_wam_by_group())
         
         # C1: Total WAM
         fig, ax = plt.subplots(figsize=CONFIG.figsize_medium)
@@ -147,7 +162,7 @@ class ChartGenerator:
         ax.set_title('Weighted Average Maturity of Outstanding Treasury Portfolio', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('WAM (Years)')
+        ax.set_ylabel('Weighted average maturity (years)')
         ax.grid(True, alpha=0.3)
         
         # Add trend annotation
@@ -173,7 +188,7 @@ class ChartGenerator:
         ax.set_title('Weighted Average Maturity by Instrument Group', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('WAM (Years)')
+        ax.set_ylabel('Weighted average maturity (years)')
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -195,7 +210,7 @@ class ChartGenerator:
                     'gross issuance + TIPS accrual − buybacks − maturities', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Net Issuance (USD)')
+        ax.set_ylabel('Net issuance')
         ax.legend(title='Original Tenor', bbox_to_anchor=(1.05, 1), loc='upper left')
         self._format_yaxis_currency(ax, 'B')
         ax.axhline(0, color='black', linewidth=0.8)
@@ -229,7 +244,7 @@ class ChartGenerator:
                 linewidth=2, color='darkred')
         ax1.set_title('Bill Share of Outstanding Treasury Securities', 
                      fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Bill Share (%)')
+        ax1.set_ylabel('Bills, share of par outstanding')
         ax1.grid(True, alpha=0.3)
         ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
         
@@ -241,7 +256,7 @@ class ChartGenerator:
         ax2.text(0.01, 0.02, BILL_ISSUANCE_CAVEAT, transform=ax2.transAxes,
                  fontsize=8, color='#555555', va='bottom', fontstyle='italic')
         ax2.set_xlabel('Date')
-        ax2.set_ylabel('Bill Share (%)')
+        ax2.set_ylabel('Bills, share of gross issuance')
         ax2.grid(True, alpha=0.3)
         ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
         
@@ -256,18 +271,20 @@ class ChartGenerator:
         """Chart F: Maturity wall / rollover profile"""
         print("Creating Chart F: Maturity wall...")
         
-        pivot = self.analytics.compute_maturity_wall(horizon_years=5)
+        pivot = _label_instruments(self.analytics.compute_maturity_wall(horizon_years=5))
         latest_date = self.df['record_date'].max()
         
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         pivot.plot(kind='bar', stacked=True, ax=ax, width=0.8, alpha=0.8)
         ax.set_title(f'Treasury Maturity Wall (as of {latest_date.strftime("%Y-%m-%d")})', 
                     fontsize=14, fontweight='bold')
-        ax.set_xlabel('Maturity Quarter')
-        ax.set_ylabel('Par Maturing (USD)')
+        ax.set_xlabel('Maturity quarter')
+        ax.set_ylabel('Par maturing')
         ax.legend(title='Instrument Group', bbox_to_anchor=(1.05, 1), loc='upper left')
         self._format_yaxis_currency(ax, 'B')
-        plt.xticks(rotation=45)
+        ax.set_xticklabels(
+            [f'{d.year} Q{d.quarter}' for d in pivot.index], rotation=45, ha='right'
+        )
         plt.tight_layout()
         self._save_figure('F_maturity_wall', fig)
     
@@ -290,8 +307,8 @@ class ChartGenerator:
         ax.set_xticklabels(pivot.columns)
         ax.set_yticklabels(pivot.index)
         
-        ax.set_xlabel('Remaining Maturity Bucket', fontsize=12)
-        ax.set_ylabel('Original Tenor Program', fontsize=12)
+        ax.set_xlabel('Remaining maturity', fontsize=12)
+        ax.set_ylabel('Original tenor', fontsize=12)
         ax.set_title(
             f'Treasury Portfolio: Original Tenor vs Remaining Maturity\n'
             f'(as of {latest_date.strftime("%Y-%m-%d")})', 
@@ -299,7 +316,7 @@ class ChartGenerator:
         )
         
         cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Outstanding Par ($B)', rotation=270, labelpad=20)
+        cbar.set_label('Par outstanding ($ billions)', rotation=270, labelpad=20)
         
         # Text annotations
         for i in range(len(pivot.index)):
@@ -388,8 +405,8 @@ class ChartGenerator:
             'Portfolio Rotation: Short (≤3y) vs Long (≥7y) Share',
             fontsize=12, fontweight='bold'
         )
-        ax.set_xlabel('Short Share (≤3y) % of Total')
-        ax.set_ylabel('Long Share (≥7y) % of Total')
+        ax.set_xlabel('Short share: ≤3y to maturity (% of par)')
+        ax.set_ylabel('Long share: ≥7y to maturity (% of par)')
         ax.set_aspect('equal', adjustable='box')
         ax.grid(True, alpha=0.2)
         ax.legend(loc='lower left', fontsize=8)
@@ -423,7 +440,7 @@ class ChartGenerator:
         ax.set_title('Portfolio Refinancing Half-Life', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Half-Life (Years)')
+        ax.set_ylabel('Years until half of par matures')
         ax.grid(True, alpha=0.3)
         
         # Annotation
@@ -465,7 +482,7 @@ class ChartGenerator:
                  ' Issuance WAM is biased upward as a result.',
                  fontsize=8, color='#555555', fontstyle='italic')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Years')
+        ax.set_ylabel('Weighted average years to maturity')
         ax.legend(loc='best')
         ax.grid(True, alpha=0.3)
         
@@ -498,7 +515,7 @@ class ChartGenerator:
         ax1.set_title('Stock-Flow Bridge Error by Date\n'
                      'Δ par − (issued + TIPS accrual − buybacks − maturities)', 
                      fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Bridge Error ($B)')
+        ax1.set_ylabel('Bridge error ($ billions)')
         ax1.axhline(0, color='black', linewidth=0.8)
         ax1.grid(True, alpha=0.3, axis='y')
         
@@ -508,7 +525,7 @@ class ChartGenerator:
         ax2.set_title('Bridge Error as % of Total Outstanding', 
                      fontsize=12, fontweight='bold')
         ax2.set_xlabel('Date')
-        ax2.set_ylabel('Error (%)')
+        ax2.set_ylabel('Net bridge error (% of par)')
         ax2.axhline(0, color='black', linewidth=0.8)
         ax2.grid(True, alpha=0.3)
         
@@ -545,6 +562,7 @@ class ChartGenerator:
             index='period', columns='instrument_group', values='issued_flow_usd'
         ).fillna(0)
         issued_pivot.index = issued_pivot.index.to_timestamp()
+        issued_pivot = _label_instruments(issued_pivot)
 
         redeemed_raw = (
             df.groupby(['period', 'instrument_group'])['outflow_usd']
@@ -554,6 +572,7 @@ class ChartGenerator:
             index='period', columns='instrument_group', values='outflow_usd'
         ).fillna(0)
         redeemed_pivot.index = redeemed_pivot.index.to_timestamp()
+        redeemed_pivot = _label_instruments(redeemed_pivot)
 
         # net per quarter
         net_q = df.groupby('period').agg(
@@ -609,7 +628,7 @@ class ChartGenerator:
             'Gross Treasury Issuance vs Maturities and Redemptions by Instrument  (Quarterly)',
             fontsize=13, fontweight='bold', pad=10,
         )
-        ax_main.set_ylabel('Amount', fontsize=11)
+        ax_main.set_ylabel('Issuance (+) / maturities and buybacks (−)', fontsize=11)
         self._format_yaxis_currency(ax_main, 'B')
         ax_main.grid(True, alpha=0.2, axis='y', linestyle='--')
         ax_main.spines['top'].set_visible(False)
@@ -643,7 +662,7 @@ class ChartGenerator:
             color='#d62728', alpha=0.55, label='Net negative',
         )
         ax_net.axhline(0, color='#333333', linewidth=0.9)
-        ax_net.set_ylabel('Net Issuance', fontsize=10)
+        ax_net.set_ylabel('Net issuance', fontsize=10)
         ax_net.set_xlabel('Date', fontsize=11)
         self._format_yaxis_currency(ax_net, 'B')
         ax_net.grid(True, alpha=0.2, axis='y', linestyle='--')
@@ -691,6 +710,7 @@ class ChartGenerator:
             values='par_outstanding_usd',
         ).fillna(0)
         pivot.index = pivot.index.to_timestamp()
+        pivot = _label_instruments(pivot)
 
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         pivot.plot(kind='bar', stacked=True, ax=ax, alpha=0.85, width=0.7)
@@ -699,8 +719,8 @@ class ChartGenerator:
             f'(as of {latest_date.strftime("%Y-%m-%d")})',
             fontsize=14, fontweight='bold',
         )
-        ax.set_xlabel('Maturity Month')
-        ax.set_ylabel('Par Maturing (USD)')
+        ax.set_xlabel('Maturity month')
+        ax.set_ylabel('Par maturing')
         self._format_yaxis_currency(ax, 'B')
         ax.legend(title='Instrument', bbox_to_anchor=(1.05, 1), loc='upper left')
         n = len(pivot)
@@ -743,7 +763,7 @@ class ChartGenerator:
         ax.set_title('Outstanding Treasury Securities by Issuance Vintage',
                      fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Outstanding Par (USD)')
+        ax.set_ylabel('Par outstanding')
         self._format_yaxis_currency(ax, 'T')
 
         # Thin the legend if there are many vintages
@@ -799,8 +819,8 @@ class ChartGenerator:
         ax.set_ylim(0, 100)
         ax.set_title('Cumulative Maturity Distribution (Selected Snapshots)',
                      fontsize=14, fontweight='bold')
-        ax.set_xlabel('Years to Maturity')
-        ax.set_ylabel('Cumulative % of Par Outstanding')
+        ax.set_xlabel('Years to maturity')
+        ax.set_ylabel('Cumulative share of par outstanding')
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
         ax.legend(title='As Of', bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, alpha=0.3)
@@ -825,7 +845,7 @@ class ChartGenerator:
                          alpha=0.6, color='steelblue', label='Trailing 12-month Gross Issuance')
         ax1.plot(monthly['period_ts'], monthly['total_outstanding'],
                  color='black', linewidth=2, label='Total Outstanding')
-        ax1.set_ylabel('Amount')
+        ax1.set_ylabel('Par')
         ax1.set_title('Trailing 12-Month Gross Issuance vs Total Outstanding',
                       fontsize=12, fontweight='bold')
         ax1.legend(loc='upper left')
@@ -837,7 +857,7 @@ class ChartGenerator:
                  linewidth=2, color='darkred')
         ax2.axhline(100, color='gray', linestyle='--', linewidth=1, alpha=0.7,
                     label='100% (full portfolio turnover)')
-        ax2.set_ylabel('Rollover Rate (%)')
+        ax2.set_ylabel('12m gross issuance, % of par outstanding')
         ax2.set_xlabel('Date')
         ax2.set_title('Trailing 12-Month Gross Rollover Rate (% of Outstanding)',
                       fontsize=12, fontweight='bold')
@@ -892,7 +912,7 @@ class ChartGenerator:
                             fontsize=7, color=text_color)
 
         cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-        cbar.set_label('Gross Issuance ($B)', rotation=270, labelpad=20)
+        cbar.set_label('Gross issuance ($ billions)', rotation=270, labelpad=20)
         ax.set_title('Treasury Gross Issuance Seasonality (Year × Month)',
                      fontsize=14, fontweight='bold')
         ax.set_xlabel('Month')
@@ -931,7 +951,7 @@ class ChartGenerator:
         ax.set_title('Treasury Portfolio Maturity: WAM and Distribution Band',
                      fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Years to Maturity')
+        ax.set_ylabel('Years to maturity')
         ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
         ax.set_ylim(bottom=0)
@@ -974,7 +994,7 @@ class ChartGenerator:
             colors=['steelblue', 'tomato'],
             alpha=0.8,
         )
-        ax1.set_ylabel('Amount')
+        ax1.set_ylabel('TIPS par outstanding')
         ax1.set_title('TIPS Outstanding: Original Par vs Inflation Accrual',
                       fontsize=12, fontweight='bold')
         ax1.legend(loc='upper left')
@@ -991,7 +1011,7 @@ class ChartGenerator:
                  linewidth=2, color='darkred')
         ax2.fill_between(by_date['record_date'], by_date['accrual_pct'],
                          alpha=0.2, color='darkred')
-        ax2.set_ylabel('Inflation Accrual as % of TIPS Par')
+        ax2.set_ylabel('Inflation accrual, % of TIPS par')
         ax2.set_xlabel('Date')
         ax2.set_title('Cumulative Inflation Accrual as % of TIPS Outstanding',
                       fontsize=12, fontweight='bold')
@@ -1082,7 +1102,7 @@ class TGAChartGenerator:
         ax.set_title('Upcoming Maturities as % of TGA Balance', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Maturing Par / TGA Balance (%)')
+        ax.set_ylabel('Par maturing, % of TGA balance')
         ax.axhline(100, color='red', linestyle='--', linewidth=1, alpha=0.5,
                    label='100% = maturities equal TGA balance')
         ax.legend(title='Horizon', loc='best')
@@ -1133,7 +1153,7 @@ class TGAChartGenerator:
                 alpha=0.3, color='red', label='Deficit'
             )
             
-            ax.set_ylabel('Amount ($T)')
+            ax.set_ylabel('$ trillions')
             ax.set_title(f'{horizon_labels[horizon]} Horizon', fontweight='bold')
             ax.legend(loc='best', fontsize=9)
             ax.grid(True, alpha=0.3)

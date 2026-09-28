@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CONFIG, get_bucket_order, format_currency
 from analytics import PortfolioAnalytics
+from charts import INSTRUMENT_LABELS
 
 
 class MetricCard(ttk.Frame):
@@ -493,7 +494,7 @@ class DashboardApp:
         panel.ax.plot(metrics['record_date'], metrics['wam_years'], 
                      linewidth=2, color='navy')
         panel.ax.set_xlabel('Date')
-        panel.ax.set_ylabel('WAM (Years)')
+        panel.ax.set_ylabel('Weighted average maturity (years)')
         panel.ax.grid(True, alpha=0.3)
         
         # Mark current date
@@ -510,6 +511,7 @@ class DashboardApp:
         
         snapshot = self.analytics.get_snapshot(self.current_date)
         by_group = snapshot.groupby('instrument_group')['par_outstanding_usd'].sum()
+        by_group = by_group.rename(index=INSTRUMENT_LABELS)
         
         # Filter small slices
         total = by_group.sum()
@@ -534,10 +536,11 @@ class DashboardApp:
         panel.clear()
         
         pivot = self.analytics.compute_composition_by_instrument()
+        pivot = pivot.rename(columns=INSTRUMENT_LABELS)
         
         pivot.plot(kind='area', stacked=True, ax=panel.ax, alpha=0.8, legend=True)
         panel.ax.set_xlabel('Date')
-        panel.ax.set_ylabel('Outstanding ($)')
+        panel.ax.set_ylabel('Par outstanding')
         panel.ax.yaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, p: f'${x/1e12:.1f}T')
         )
@@ -554,7 +557,7 @@ class DashboardApp:
         
         pivot.plot(kind='area', stacked=True, ax=panel.ax, alpha=0.8, legend=True)
         panel.ax.set_xlabel('Date')
-        panel.ax.set_ylabel('Outstanding ($)')
+        panel.ax.set_ylabel('Par outstanding')
         panel.ax.yaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, p: f'${x/1e12:.1f}T')
         )
@@ -575,7 +578,7 @@ class DashboardApp:
         
         pivot.plot(kind='bar', stacked=True, ax=panel.ax, width=0.8, alpha=0.8)
         panel.ax.set_xlabel('Date')
-        panel.ax.set_ylabel('Net Issuance ($)')
+        panel.ax.set_ylabel('Net issuance')
         panel.ax.yaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, p: f'${x/1e9:.0f}B')
         )
@@ -603,7 +606,7 @@ class DashboardApp:
         panel.ax.plot(bill_data.index, bill_data['bill_stock_share'], 
                      linewidth=2, label='Stock Share', color='darkred')
         panel.ax.set_xlabel('Date')
-        panel.ax.set_ylabel('Bill Share (%)')
+        panel.ax.set_ylabel('Bills, share of par outstanding')
         panel.ax.legend(loc='upper right')
         panel.ax.grid(True, alpha=0.3)
         panel.ax.yaxis.set_major_formatter(
@@ -618,6 +621,7 @@ class DashboardApp:
         panel.clear()
         
         pivot = self.analytics.compute_maturity_wall(horizon_years=5, date=self.current_date)
+        pivot = pivot.rename(columns=INSTRUMENT_LABELS)
         
         if len(pivot) == 0:
             panel.ax.text(0.5, 0.5, 'No data', ha='center', va='center')
@@ -625,15 +629,18 @@ class DashboardApp:
             return
         
         pivot.plot(kind='bar', stacked=True, ax=panel.ax, width=0.8, alpha=0.8)
-        panel.ax.set_xlabel('Maturity Quarter')
-        panel.ax.set_ylabel('Par Maturing ($)')
+        panel.ax.set_xlabel('Maturity quarter')
+        panel.ax.set_ylabel('Par maturing')
         panel.ax.yaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, p: f'${x/1e9:.0f}B')
         )
         panel.ax.legend(loc='upper right', fontsize=7)
         
-        # Clean up x-axis
-        plt.setp(panel.ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
+        # Quarter labels instead of raw timestamps
+        panel.ax.set_xticklabels(
+            [f'{d.year} Q{d.quarter}' for d in pivot.index],
+            rotation=45, ha='right', fontsize=8
+        )
         
         panel.refresh()
     
@@ -681,8 +688,8 @@ class DashboardApp:
         panel.ax.scatter([end['short_share_pct']], [end['long_share_pct']],
                         s=60, facecolors='gold', edgecolors='black', zorder=3)
         
-        panel.ax.set_xlabel('Short Share (≤3y) %')
-        panel.ax.set_ylabel('Long Share (≥7y) %')
+        panel.ax.set_xlabel('Short share: ≤3y to maturity (% of par)')
+        panel.ax.set_ylabel('Long share: ≥7y to maturity (% of par)')
         panel.ax.grid(True, alpha=0.2)
         
         panel.refresh()
