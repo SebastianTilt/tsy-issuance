@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Callable
@@ -53,7 +53,7 @@ class MetricCard(ttk.Frame):
         )
         self.change_label.pack(anchor='w')
     
-    def update(self, value: str, change: str = "", change_positive: bool = True):
+    def set_value(self, value: str, change: str = "", change_positive: bool = True):
         """Update the metric value and change"""
         self.value_var.set(value)
         self.change_var.set(change)
@@ -81,11 +81,6 @@ class ChartPanel(ttk.Frame):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Toolbar (optional, can be hidden)
-        self.toolbar_frame = ttk.Frame(self)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
-        self.toolbar.update()
     
     def clear(self):
         """Clear the chart"""
@@ -123,6 +118,7 @@ class DashboardApp:
         # Data
         self.df: Optional[pd.DataFrame] = None
         self.analytics: Optional[PortfolioAnalytics] = None
+        self.metrics_ts: Optional[pd.DataFrame] = None
         self.available_dates: List[pd.Timestamp] = []
         self.current_date: Optional[pd.Timestamp] = None
         
@@ -149,7 +145,7 @@ class DashboardApp:
         style = ttk.Style()
         try:
             style.theme_use('clam')
-        except:
+        except tk.TclError:
             pass
         
         style.configure('Title.TLabel', font=('Helvetica', 16, 'bold'))
@@ -206,10 +202,11 @@ class DashboardApp:
         self.date_combo.pack(side=tk.LEFT, padx=5)
         self.date_combo.bind('<<ComboboxSelected>>', self._on_date_change)
         
-        # Refresh button
+        # Reload button (re-reads the processed panel from disk; it does not
+        # call the API. Run `python main.py --pipeline` for new data.)
         self.refresh_btn = ttk.Button(
             controls, 
-            text="🔄 Refresh",
+            text="🔄 Reload from disk",
             command=self._refresh_data
         )
         self.refresh_btn.pack(side=tk.LEFT, padx=10)
@@ -393,7 +390,7 @@ class DashboardApp:
                         "Data Not Found",
                         "No processed data found.\n\n"
                         "Please run the data pipeline first:\n"
-                        "python data_ingest.py"
+                        "python main.py --pipeline"
                     )
                 elif status == 'error':
                     self.status_var.set(f"Error: {data}")
@@ -409,6 +406,8 @@ class DashboardApp:
         """Handle successful data load"""
         self.df = df
         self.analytics = PortfolioAnalytics(df)
+        # Time series don't depend on the selected date: compute once per load
+        self.metrics_ts = self.analytics.compute_metrics_timeseries()
         
         # Get available dates
         self.available_dates = sorted(df['record_date'].unique())
@@ -448,6 +447,16 @@ class DashboardApp:
         self._update_maturity_wall_chart()
         self._update_rotation_chart()
     
+    def _refresh_snapshot_charts(self):
+        """Redraw only the views that depend on the selected date"""
+        if self.df is None:
+            return
+        
+        self._update_metrics()
+        self._update_wam_chart()  # cheap: uses cached time series, moves marker
+        self._update_composition_chart()
+        self._update_maturity_wall_chart()
+    
     def _update_metrics(self):
         """Update metric cards"""
         if self.analytics is None:
@@ -455,22 +464,22 @@ class DashboardApp:
         
         metrics = self.analytics.compute_portfolio_metrics(self.current_date)
         
-        self.metric_cards['total_outstanding'].update(
+        self.metric_cards['total_outstanding'].set_value(
             format_currency(metrics.total_outstanding)
         )
-        self.metric_cards['cusip_count'].update(
+        self.metric_cards['cusip_count'].set_value(
             f"{metrics.cusip_count:,}"
         )
-        self.metric_cards['wam'].update(
+        self.metric_cards['wam'].set_value(
             f"{metrics.weighted_avg_maturity:.2f}"
         )
-        self.metric_cards['short_share'].update(
+        self.metric_cards['short_share'].set_value(
             f"{metrics.short_share:.1f}%"
         )
-        self.metric_cards['long_share'].update(
+        self.metric_cards['long_share'].set_value(
             f"{metrics.long_share:.1f}%"
         )
-        self.metric_cards['bill_share'].update(
+        self.metric_cards['bill_share'].set_value(
             f"{metrics.bill_share:.1f}%"
         )
     
@@ -479,7 +488,7 @@ class DashboardApp:
         panel = self.chart_panels['wam']
         panel.clear()
         
-        metrics = self.analytics.compute_metrics_timeseries()
+        metrics = self.metrics_ts
         
         panel.ax.plot(metrics['record_date'], metrics['wam_years'], 
                      linewidth=2, color='navy')
@@ -633,7 +642,7 @@ class DashboardApp:
         panel = self.chart_panels['rotation']
         panel.clear()
         
-        rotation = self.analytics.compute_short_long_rotation()
+        rotation = self.metrics_ts[['record_date', 'short_share_pct', 'long_share_pct']]
         n = len(rotation)
         
         if n < 2:
@@ -686,11 +695,11 @@ class DashboardApp:
         """Handle date selection change"""
         date_str = self.date_var.get()
         self.current_date = pd.Timestamp(date_str)
-        self._refresh_all_charts()
+        self._refresh_snapshot_charts()
     
     def _refresh_data(self):
-        """Refresh data from source"""
-        self.status_var.set("Refreshing data...")
+        """Reload the processed panel from disk"""
+        self.status_var.set("Reloading data from disk...")
         self._start_data_load()
     
     def _export_charts(self):
