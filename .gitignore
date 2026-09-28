@@ -1,0 +1,17 @@
+# OS / editor
+.DS_Store
+.claude/
+.venv/
+
+# Python
+__pycache__/
+
+# Generated data and output
+cache/
+data/
+charts/
+*.parquet
+*.csv
+
+# Private notes (not for publication)
+_private/
