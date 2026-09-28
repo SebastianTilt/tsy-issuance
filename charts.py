@@ -13,6 +13,12 @@ from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 
 from config import CONFIG, get_bucket_order, get_tenor_order, format_currency
+
+# Caveat for charts built on gross issuance, which misses intramonth bills
+BILL_ISSUANCE_CAVEAT = (
+    "Month-end MSPD snapshots miss bills issued and matured within the same month "
+    "(4/6/8-week bills, CMBs),\nso bill gross issuance is understated."
+)
 from analytics import (
     PortfolioAnalytics,
     TGAAnalytics,
@@ -43,17 +49,18 @@ class ChartGenerator:
     
     def _format_yaxis_currency(self, ax, scale: str = 'T'):
         """Format y-axis as currency"""
+        sign = lambda x: '-' if x < 0 else ''
         if scale == 'T':
             ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, p: f'${x/1e12:.1f}T')
+                plt.FuncFormatter(lambda x, p: f'{sign(x)}${abs(x)/1e12:.1f}T')
             )
         elif scale == 'B':
             ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, p: f'${x/1e9:.0f}B')
+                plt.FuncFormatter(lambda x, p: f'{sign(x)}${abs(x)/1e9:,.0f}B')
             )
         else:
             ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, p: f'${x/1e6:.0f}M')
+                plt.FuncFormatter(lambda x, p: f'{sign(x)}${abs(x)/1e6:,.0f}M')
             )
     
     # =========================================================================
@@ -177,18 +184,19 @@ class ChartGenerator:
     # =========================================================================
     
     def chart_net_issuance(self):
-        """Chart D: Net issuance by maturity bucket"""
+        """Chart D: Net issuance by original tenor program"""
         print("Creating Chart D: Net issuance...")
         
         pivot = self.analytics.compute_net_issuance_by_tenor(freq='M')
         
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         pivot.plot(kind='bar', stacked=True, ax=ax, width=0.8, alpha=0.8)
-        ax.set_title('Net Issuance by Maturity Bucket (Monthly)', 
+        ax.set_title('Net Issuance by Original Tenor (Monthly)\n'
+                    'gross issuance + TIPS accrual − buybacks − maturities', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
         ax.set_ylabel('Net Issuance (USD)')
-        ax.legend(title='Maturity Bucket', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.legend(title='Original Tenor', bbox_to_anchor=(1.05, 1), loc='upper left')
         self._format_yaxis_currency(ax, 'B')
         ax.axhline(0, color='black', linewidth=0.8)
         
@@ -202,7 +210,7 @@ class ChartGenerator:
         )
         
         plt.tight_layout()
-        self._save_figure('D_net_issuance_by_bucket', fig)
+        self._save_figure('D_net_issuance_by_tenor', fig)
     
     # =========================================================================
     # BILL SHARE (E)
@@ -230,6 +238,8 @@ class ChartGenerator:
                 linewidth=2, color='darkblue')
         ax2.set_title('Bill Share of Gross Issuance', 
                      fontsize=12, fontweight='bold')
+        ax2.text(0.01, 0.02, BILL_ISSUANCE_CAVEAT, transform=ax2.transAxes,
+                 fontsize=8, color='#555555', va='bottom', fontstyle='italic')
         ax2.set_xlabel('Date')
         ax2.set_ylabel('Bill Share (%)')
         ax2.grid(True, alpha=0.3)
@@ -433,28 +443,34 @@ class ChartGenerator:
     # =========================================================================
     
     def chart_issuance_wam(self):
-        """Chart U: Issuance WAM over time"""
-        print("Creating Chart U: Issuance WAM...")
+        """Chart U: WAM of new issuance vs WAM of the outstanding stock"""
+        print("Creating Chart U: Issuance WAM vs stock WAM...")
         
         issuance_wam = compute_issuance_wam(self.df, freq='M')
-        halflife = compute_refinancing_halflife(self.df)
+        metrics = self.analytics.compute_metrics_timeseries()
         
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         
         ax.plot(issuance_wam['period'], issuance_wam['issuance_wam'], 
-               linewidth=2, color='blue', label='Issuance WAM', alpha=0.8)
-        ax.plot(halflife['record_date'], halflife['half_life_years'], 
-               linewidth=2, color='red', label='Portfolio Half-Life', alpha=0.8)
+               linewidth=1, color='blue', alpha=0.35, label='New issuance WAM (monthly)')
+        ax.plot(issuance_wam['period'], issuance_wam['issuance_wam'].rolling(12).mean(),
+               linewidth=2, color='blue', label='New issuance WAM (12m avg)')
+        ax.plot(metrics['record_date'], metrics['wam_years'], 
+               linewidth=2, color='red', label='Outstanding stock WAM')
         
-        ax.set_title('New Issuance WAM vs Portfolio Half-Life', 
+        ax.set_title('Remaining Maturity: New Issuance vs Outstanding Stock\n'
+                    '(par-weighted years to maturity at month-end)', 
                     fontsize=14, fontweight='bold')
+        fig.text(0.01, 0.005, BILL_ISSUANCE_CAVEAT +
+                 ' Issuance WAM is biased upward as a result.',
+                 fontsize=8, color='#555555', fontstyle='italic')
         ax.set_xlabel('Date')
         ax.set_ylabel('Years')
         ax.legend(loc='best')
         ax.grid(True, alpha=0.3)
         
-        plt.tight_layout()
-        self._save_figure('U_issuance_wam_vs_halflife', fig)
+        plt.tight_layout(rect=(0, 0.03, 1, 1))
+        self._save_figure('U_issuance_wam_vs_stock_wam', fig)
     
     # =========================================================================
     # BRIDGE DIAGNOSTICS (O)
@@ -473,10 +489,14 @@ class ChartGenerator:
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
         
-        # O1: Error sum over time
-        ax1.bar(summary.index, summary['error_sum'] / 1e9, 
-               alpha=0.7, color='steelblue')
-        ax1.set_title('Aggregate Bridge Error by Date', 
+        # O1: Net and absolute error over time
+        ax1.bar(summary.index, summary['error_sum'] / 1e9, width=25,
+               alpha=0.7, color='steelblue', label='Net error (sum)')
+        ax1.plot(summary.index, summary['error_abs'] / 1e9,
+                linewidth=1, color='darkorange', label='Absolute error (sum of |error|)')
+        ax1.legend(loc='upper left', fontsize=9)
+        ax1.set_title('Stock-Flow Bridge Error by Date\n'
+                     'Δ par − (issued + TIPS accrual − buybacks − maturities)', 
                      fontsize=12, fontweight='bold')
         ax1.set_ylabel('Bridge Error ($B)')
         ax1.axhline(0, color='black', linewidth=0.8)
@@ -502,17 +522,19 @@ class ChartGenerator:
     def chart_gross_issuance_redemptions(self):
         """
         Chart P: Quarterly butterfly chart — gross issuance (above zero) and
-        gross redemptions (below zero), stacked by instrument group, with a
-        separate net issuance strip below.
+        gross outflows (maturities + buybacks, below zero), stacked by
+        instrument group, with a separate net issuance strip below.
 
         Quarterly aggregation keeps ~60 bars over the full history so each bar
         is clearly visible.  Issuance and redemptions use the same colour per
         instrument but different opacity so the two halves read as a mirror.
         """
-        print("Creating Chart P: Gross issuance vs redemptions...")
+        print("Creating Chart P: Gross issuance vs maturities and redemptions...")
 
         df = self.df.copy()
         df['period'] = df['record_date'].dt.to_period('Q')
+        # Gross outflow = maturities + buybacks/early redemptions
+        df['outflow_usd'] = df['matured_usd'] + df['redeemed_flow_usd']
 
         # ── per-instrument quarterly totals ──────────────────────────────────
         issued_raw = (
@@ -525,20 +547,18 @@ class ChartGenerator:
         issued_pivot.index = issued_pivot.index.to_timestamp()
 
         redeemed_raw = (
-            df.groupby(['period', 'instrument_group'])['redeemed_flow_usd']
+            df.groupby(['period', 'instrument_group'])['outflow_usd']
             .sum().reset_index()
         )
         redeemed_pivot = redeemed_raw.pivot(
-            index='period', columns='instrument_group', values='redeemed_flow_usd'
+            index='period', columns='instrument_group', values='outflow_usd'
         ).fillna(0)
         redeemed_pivot.index = redeemed_pivot.index.to_timestamp()
 
         # net per quarter
         net_q = df.groupby('period').agg(
-            issued=('issued_flow_usd', 'sum'),
-            redeemed=('redeemed_flow_usd', 'sum'),
+            net=('net_issuance_usd', 'sum'),
         ).reset_index()
-        net_q['net'] = net_q['issued'] - net_q['redeemed']
         net_q['period_ts'] = net_q['period'].dt.to_timestamp()
 
         # ── consistent colour map across both halves ──────────────────────────
@@ -563,7 +583,7 @@ class ChartGenerator:
         for inst in all_instruments:
             if inst not in issued_pivot.columns:
                 continue
-            vals = issued_pivot[inst].values / 1e9
+            vals = issued_pivot[inst].values
             ax_main.bar(
                 issued_pivot.index, vals, bottom=bottoms,
                 width=bar_width, color=color_map[inst],
@@ -576,7 +596,7 @@ class ChartGenerator:
         for inst in all_instruments:
             if inst not in redeemed_pivot.columns:
                 continue
-            vals = redeemed_pivot[inst].values / 1e9
+            vals = redeemed_pivot[inst].values
             ax_main.bar(
                 redeemed_pivot.index, -vals, bottom=-bottoms_neg,
                 width=bar_width, color=color_map[inst],
@@ -586,10 +606,10 @@ class ChartGenerator:
 
         ax_main.axhline(0, color='#333333', linewidth=1.2)
         ax_main.set_title(
-            'Gross Treasury Issuance vs Gross Redemptions by Instrument  (Quarterly)',
+            'Gross Treasury Issuance vs Maturities and Redemptions by Instrument  (Quarterly)',
             fontsize=13, fontweight='bold', pad=10,
         )
-        ax_main.set_ylabel('Amount ($B)', fontsize=11)
+        ax_main.set_ylabel('Amount', fontsize=11)
         self._format_yaxis_currency(ax_main, 'B')
         ax_main.grid(True, alpha=0.2, axis='y', linestyle='--')
         ax_main.spines['top'].set_visible(False)
@@ -599,7 +619,7 @@ class ChartGenerator:
         ax_main.text(0.012, 0.97, 'GROSS ISSUANCE',
                      transform=ax_main.transAxes,
                      fontsize=9, color='#555555', va='top', fontstyle='italic')
-        ax_main.text(0.012, 0.03, 'GROSS REDEMPTIONS',
+        ax_main.text(0.012, 0.03, 'MATURITIES + BUYBACKS',
                      transform=ax_main.transAxes,
                      fontsize=9, color='#555555', va='bottom', fontstyle='italic')
 
@@ -610,20 +630,20 @@ class ChartGenerator:
         )
 
         # ── net strip ─────────────────────────────────────────────────────────
-        ax_net.plot(net_q['period_ts'], net_q['net'] / 1e9,
+        ax_net.plot(net_q['period_ts'], net_q['net'],
                     color='#222222', linewidth=1.4, zorder=3)
         ax_net.fill_between(
-            net_q['period_ts'], net_q['net'] / 1e9, 0,
+            net_q['period_ts'], net_q['net'], 0,
             where=(net_q['net'] >= 0),
             color='#2ca02c', alpha=0.55, label='Net positive',
         )
         ax_net.fill_between(
-            net_q['period_ts'], net_q['net'] / 1e9, 0,
+            net_q['period_ts'], net_q['net'], 0,
             where=(net_q['net'] < 0),
             color='#d62728', alpha=0.55, label='Net negative',
         )
         ax_net.axhline(0, color='#333333', linewidth=0.9)
-        ax_net.set_ylabel('Net ($B)', fontsize=10)
+        ax_net.set_ylabel('Net Issuance', fontsize=10)
         ax_net.set_xlabel('Date', fontsize=11)
         self._format_yaxis_currency(ax_net, 'B')
         ax_net.grid(True, alpha=0.2, axis='y', linestyle='--')
@@ -635,8 +655,9 @@ class ChartGenerator:
         ax_net.xaxis.set_major_locator(mdates.YearLocator(2))
         plt.setp(ax_net.get_xticklabels(), rotation=0, ha='center')
 
-        plt.tight_layout()
-        self._save_figure('P_gross_issuance_vs_redemptions', fig)
+        # No tight_layout: the gridspec sets hspace explicitly, and
+        # savefig(bbox_inches='tight') trims the margins.
+        self._save_figure('P_gross_issuance_vs_outflows', fig)
 
     # =========================================================================
     # 12-MONTH FORWARD MATURITY CALENDAR (Q)
@@ -800,11 +821,11 @@ class ChartGenerator:
 
         # Top panel: rolling 12-month gross issuance in $T
         ax1.fill_between(monthly['period_ts'],
-                         monthly['rolling_issued'] / 1e12,
+                         monthly['rolling_issued'],
                          alpha=0.6, color='steelblue', label='Trailing 12-month Gross Issuance')
-        ax1.plot(monthly['period_ts'], monthly['total_outstanding'] / 1e12,
+        ax1.plot(monthly['period_ts'], monthly['total_outstanding'],
                  color='black', linewidth=2, label='Total Outstanding')
-        ax1.set_ylabel('Amount ($T)')
+        ax1.set_ylabel('Amount')
         ax1.set_title('Trailing 12-Month Gross Issuance vs Total Outstanding',
                       fontsize=12, fontweight='bold')
         ax1.legend(loc='upper left')
@@ -838,14 +859,16 @@ class ChartGenerator:
         """Chart V: Gross issuance heatmap by year × calendar month"""
         print("Creating Chart V: Issuance seasonality heatmap...")
 
-        df = self.df.copy()
+        # The first snapshot has no flows (NaN); leave it and months not yet
+        # published blank rather than showing them as zero issuance.
+        df = self.df[self.df['issued_flow_usd'].notna()].copy()
         df['year'] = df['record_date'].dt.year
         df['month'] = df['record_date'].dt.month
 
         monthly = df.groupby(['year', 'month'])['issued_flow_usd'].sum().reset_index()
         pivot = monthly.pivot(
             index='year', columns='month', values='issued_flow_usd'
-        ).fillna(0)
+        ).reindex(columns=range(1, 13))
         pivot.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -857,11 +880,12 @@ class ChartGenerator:
         ax.set_yticks(range(len(pivot.index)))
         ax.set_yticklabels(pivot.index)
 
-        vmax = pivot.values.max()
+        ax.grid(False)
+        vmax = np.nanmax(pivot.values)
         for i in range(len(pivot.index)):
             for j in range(12):
                 val = pivot.values[i, j]
-                if val > 0:
+                if pd.notna(val) and val > 0:
                     text_color = 'white' if val > vmax * 0.6 else 'black'
                     ax.text(j, i, f'{val / 1e9:.0f}',
                             ha='center', va='center',
@@ -873,7 +897,9 @@ class ChartGenerator:
                      fontsize=14, fontweight='bold')
         ax.set_xlabel('Month')
         ax.set_ylabel('Year')
-        plt.tight_layout()
+        plt.tight_layout(rect=(0, 0.04, 1, 1))
+        fig.text(0.01, 0.005, BILL_ISSUANCE_CAVEAT, fontsize=8,
+                 color='#555555', fontstyle='italic')
         self._save_figure('V_issuance_seasonality', fig)
 
     # =========================================================================
@@ -942,13 +968,13 @@ class ChartGenerator:
         # Top panel: stacked area of original par + inflation accrual
         ax1.stackplot(
             by_date['record_date'],
-            by_date['original_par'] / 1e12,
-            by_date['accrual'] / 1e12,
+            by_date['original_par'],
+            by_date['accrual'],
             labels=['Original Par', 'Inflation Accrual'],
             colors=['steelblue', 'tomato'],
             alpha=0.8,
         )
-        ax1.set_ylabel('Amount ($T)')
+        ax1.set_ylabel('Amount')
         ax1.set_title('TIPS Outstanding: Original Par vs Inflation Accrual',
                       fontsize=12, fontweight='bold')
         ax1.legend(loc='upper left')
@@ -1038,8 +1064,8 @@ class TGAChartGenerator:
         print(f"  Saved: {path.name}")
     
     def chart_tga_coverage_ratios(self, coverage_df: pd.DataFrame):
-        """TGA coverage ratios over time"""
-        print("Creating TGA coverage chart...")
+        """Upcoming maturities as a % of the TGA balance, by horizon"""
+        print("Creating maturities-to-TGA chart...")
         
         horizons = CONFIG.tga_horizons
         horizon_labels = {30: '30d', 60: '60d', 90: '90d', 180: '6m', 365: '1y'}
@@ -1047,22 +1073,23 @@ class TGAChartGenerator:
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         
         for horizon in horizons:
-            col = f'coverage_{horizon}d_pct'
+            col = f'maturities_to_tga_{horizon}d_pct'
             if col in coverage_df.columns:
                 ax.plot(coverage_df['record_date'], coverage_df[col],
                        linewidth=2, label=horizon_labels.get(horizon, f'{horizon}d'),
                        alpha=0.8)
         
-        ax.set_title('TGA Balance as % of Upcoming Maturities', 
+        ax.set_title('Upcoming Maturities as % of TGA Balance', 
                     fontsize=14, fontweight='bold')
         ax.set_xlabel('Date')
-        ax.set_ylabel('Coverage Ratio (%)')
+        ax.set_ylabel('Maturing Par / TGA Balance (%)')
+        ax.axhline(100, color='red', linestyle='--', linewidth=1, alpha=0.5,
+                   label='100% = maturities equal TGA balance')
         ax.legend(title='Horizon', loc='best')
         ax.grid(True, alpha=0.3)
-        ax.axhline(100, color='red', linestyle='--', linewidth=1, alpha=0.5)
         
         plt.tight_layout()
-        self._save_figure('TGA_coverage_ratios', fig)
+        self._save_figure('TGA_maturities_to_tga', fig)
     
     def chart_tga_vs_maturities(self, coverage_df: pd.DataFrame):
         """TGA balance vs maturing debt"""

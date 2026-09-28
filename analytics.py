@@ -302,8 +302,8 @@ class PortfolioAnalytics:
         # If multiple record_dates fall in the same month, keep the last.
         stock = stock[~stock.index.duplicated(keep='last')]
 
-        # Issuance share (monthly)
-        df = self.df.copy()
+        # Issuance share (monthly); the first snapshot has no flows
+        df = self.df[self.df['issued_flow_usd'].notna()].copy()
         df['year_month'] = df['record_date'].dt.to_period('M')
 
         issuance = df.groupby(['year_month', 'is_bill'])['issued_flow_usd'].sum()
@@ -312,7 +312,7 @@ class PortfolioAnalytics:
         issuance['bill_issuance_share'] = np.where(
             total_issuance > 0,
             issuance.get(True, 0) / total_issuance * 100,
-            0
+            np.nan
         )
         issuance.index = issuance.index.to_timestamp()
 
@@ -428,16 +428,18 @@ class TGAAnalytics:
         horizons: Optional[List[int]] = None
     ) -> pd.DataFrame:
         """
-        Compute TGA coverage ratios for various horizons.
+        Compute maturities-to-TGA ratios for various horizons.
         
-        Coverage = (Par maturing within horizon) / TGA balance * 100
+        maturities_to_tga_{h}d_pct = (par maturing within h days) / TGA balance * 100
         
-        Higher values mean TGA would need to roll more debt.
+        Above 100% the maturing debt exceeds the cash in the TGA, so it must
+        be rolled rather than paid down from cash. (This is the inverse of a
+        coverage ratio.)
         """
         if horizons is None:
             horizons = CONFIG.tga_horizons
         
-        print("Computing TGA coverage ratios...")
+        print("Computing maturities-to-TGA ratios...")
         
         # Find overlapping date range
         mspd_min = self.mspd_df['record_date'].min()
@@ -456,7 +458,8 @@ class TGAAnalytics:
         # Filter MSPD to overlap
         mspd = self.mspd_df[
             (self.mspd_df['record_date'] >= overlap_start) &
-            (self.mspd_df['record_date'] <= overlap_end)
+            (self.mspd_df['record_date'] <= overlap_end) &
+            self.mspd_df['is_outstanding']
         ]
         
         # Get unique MSPD dates
@@ -503,15 +506,15 @@ class TGAAnalytics:
                 ]
                 
                 maturing_par = maturing['par_outstanding_usd'].sum()
-                coverage = (maturing_par / tga_balance * 100) if tga_balance > 0 else np.nan
+                ratio = (maturing_par / tga_balance * 100) if tga_balance > 0 else np.nan
                 
                 row[f'maturing_{horizon}d_usd'] = maturing_par
-                row[f'coverage_{horizon}d_pct'] = coverage
+                row[f'maturities_to_tga_{horizon}d_pct'] = ratio
             
             results.append(row)
         
         coverage_df = pd.DataFrame(results)
-        print(f"  Computed coverage for {len(coverage_df)} dates")
+        print(f"  Computed ratios for {len(coverage_df)} dates")
         
         return coverage_df
     
@@ -519,8 +522,8 @@ class TGAAnalytics:
         self, 
         horizon_days: int = 90
     ) -> pd.DataFrame:
-        """Compute coverage breakdown by instrument group"""
-        print(f"Computing coverage by instrument ({horizon_days}d horizon)...")
+        """Compute maturities-to-TGA breakdown by instrument group"""
+        print(f"Computing maturities-to-TGA by instrument ({horizon_days}d horizon)...")
         
         # Use subset of dates for performance
         mspd_dates = sorted(self.mspd_df['record_date'].unique())[::3]
@@ -550,7 +553,7 @@ class TGAAnalytics:
                     'record_date': current_date,
                     'instrument_group': instrument,
                     'maturing_par_usd': par,
-                    'coverage_pct': par / tga_balance * 100,
+                    'maturities_to_tga_pct': par / tga_balance * 100,
                 })
         
         return pd.DataFrame(results)
@@ -568,8 +571,14 @@ def compute_refinancing_halflife(df: pd.DataFrame) -> pd.DataFrame:
     results = []
     
     for date in dates:
-        snapshot = df[df['record_date'] == date].copy()
-        snapshot = snapshot.sort_values('years_to_maturity')
+        snapshot = df[df['record_date'] == date]
+        # Same filter as WAM: drop missing/non-positive maturities (this also
+        # drops the maturity exit rows, which have par 0 and negative years)
+        snapshot = snapshot[
+            snapshot['years_to_maturity'].notna() &
+            (snapshot['years_to_maturity'] > 0) &
+            (snapshot['par_outstanding_usd'] > 0)
+        ].sort_values('years_to_maturity').copy()
         
         total_par = snapshot['par_outstanding_usd'].sum()
         if total_par == 0:
@@ -609,9 +618,13 @@ def compute_refinancing_halflife(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_issuance_wam(df: pd.DataFrame, freq: str = 'M') -> pd.DataFrame:
     """
-    Compute weighted average maturity of NEW issuance by period.
+    Compute weighted average remaining maturity of NEW issuance by period.
     
-    This shows whether Treasury is issuing shorter or longer.
+    Uses years to maturity at month-end weighted by gross issuance, the same
+    measure as the stock WAM, so the two can be compared directly. (Original
+    tenor would overstate reopenings, which are sold with less than the
+    original term remaining.) This shows whether Treasury is issuing shorter
+    or longer than the existing stock.
     """
     print("Computing issuance WAM...")
     df = df.copy()
@@ -625,10 +638,14 @@ def compute_issuance_wam(df: pd.DataFrame, freq: str = 'M') -> pd.DataFrame:
     issuance = df[df['issued_flow_usd'] > 0].copy()
     
     def calc_wam(group):
-        mask = group['orig_tenor_years'].notna() & (group['issued_flow_usd'] > 0)
+        mask = (
+            group['years_to_maturity'].notna() &
+            (group['years_to_maturity'] > 0) &
+            (group['issued_flow_usd'] > 0)
+        )
         g = group[mask]
         if len(g) > 0:
-            return np.average(g['orig_tenor_years'], weights=g['issued_flow_usd'])
+            return np.average(g['years_to_maturity'], weights=g['issued_flow_usd'])
         return np.nan
     
     wam = issuance.groupby('period').apply(calc_wam, include_groups=False).reset_index(name='issuance_wam')
@@ -645,11 +662,11 @@ def compute_rolling_rollover_rate(
 
     Rollover rate = trailing-window gross issuance / total outstanding × 100.
     A value of 100 % means Treasury must refinance the entire portfolio within
-    the window.  NaN issued_flow_usd values (first-period records) are excluded
-    from the rolling sum by pandas default (skipna=True).
+    the window.  The first snapshot (no flows) is dropped and the rate is
+    only reported once a full window of months is available.
     """
     print("Computing rolling rollover rate...")
-    d = df.copy()
+    d = df[df['issued_flow_usd'].notna()].copy()
     d['period'] = d['record_date'].dt.to_period('M')
 
     monthly = d.groupby('period').agg(
@@ -660,7 +677,7 @@ def compute_rolling_rollover_rate(
     monthly['period_ts'] = monthly['period'].dt.to_timestamp()
 
     monthly['rolling_issued'] = (
-        monthly['gross_issued'].rolling(window_months, min_periods=1).sum()
+        monthly['gross_issued'].rolling(window_months, min_periods=window_months).sum()
     )
     monthly['rollover_rate_pct'] = np.where(
         monthly['total_outstanding'] > 0,

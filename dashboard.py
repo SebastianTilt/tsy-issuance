@@ -319,7 +319,7 @@ class DashboardApp:
         self.notebook.add(tab, text="💰 Issuance")
         
         # Top: Net issuance
-        top_frame = ttk.LabelFrame(tab, text="Net Issuance by Maturity Bucket")
+        top_frame = ttk.LabelFrame(tab, text="Net Issuance by Original Tenor")
         top_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
         
         self.chart_panels['net_issuance'] = ChartPanel(top_frame, "Net Issuance", figsize=(10, 4))
