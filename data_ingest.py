@@ -258,11 +258,17 @@ class DataTransformer:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
         
-        # Clean CUSIP identifier
+        # Clean CUSIP identifier and keep only real CUSIPs. This drops the
+        # subtotal rows ("Total Treasury Notes", "Total Marketable", ...) and
+        # the Federal Financing Bank line, which have no CUSIP.
         df['CUSIP'] = df['security_class2_desc'].str.strip().str.upper()
-        
-        # Remove rows with invalid critical fields
-        df = df.dropna(subset=['record_date', 'maturity_date', 'outstanding_amt'])
+        df = df[df['CUSIP'].str.match(r'^[0-9A-Z]{9}$', na=False)]
+
+        # Remove rows with invalid critical fields. outstanding_amt is NOT
+        # required: reopening tranche rows carry issued/redeemed/inflation
+        # amounts but leave outstanding_amt null (only the first row of each
+        # CUSIP carries the security-level outstanding).
+        df = df.dropna(subset=['record_date', 'maturity_date'])
         
         print(f"  Cleaned records: {len(df):,}")
         return df
@@ -292,7 +298,8 @@ class DataTransformer:
             current_month_issues = group[group['issue_year_month'] == record_ym]
             
             return pd.Series({
-                # Stock variables (point-in-time)
+                # Stock variables (point-in-time). Only one row per CUSIP
+                # carries outstanding_amt; max() skips the null tranche rows.
                 'par_outstanding_usd': group['outstanding_amt'].max(),
                 
                 # Cumulative variables (for bridge calculation)
