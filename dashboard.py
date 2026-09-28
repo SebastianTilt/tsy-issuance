@@ -558,7 +558,7 @@ class DashboardApp:
         panel = self.chart_panels['net_issuance']
         panel.clear()
         
-        pivot = self.analytics.compute_net_issuance_by_bucket(freq='M')
+        pivot = self.analytics.compute_net_issuance_by_tenor(freq='M')
         
         # Only show recent data for readability
         if len(pivot) > 36:

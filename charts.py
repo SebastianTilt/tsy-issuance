@@ -180,7 +180,7 @@ class ChartGenerator:
         """Chart D: Net issuance by maturity bucket"""
         print("Creating Chart D: Net issuance...")
         
-        pivot = self.analytics.compute_net_issuance_by_bucket(freq='M')
+        pivot = self.analytics.compute_net_issuance_by_tenor(freq='M')
         
         fig, ax = plt.subplots(figsize=CONFIG.figsize_large)
         pivot.plot(kind='bar', stacked=True, ax=ax, width=0.8, alpha=0.8)

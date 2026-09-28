@@ -278,56 +278,34 @@ class DataTransformer:
         """
         Collapse reopenings to one row per (record_date, CUSIP, maturity_date).
         
-        IMPROVED LOGIC:
-        - par_outstanding_usd: Use max (same security can't have different outstanding amounts)
-        - issued_flow_usd: Sum only issues in the CURRENT month (not cumulative)
-        - redeemed_flow_usd: Calculate as change in redemption cumulative, not raw sum
+        - par_outstanding_usd: max of outstanding_amt (only one row per CUSIP
+          carries it; the reopening tranche rows are null)
+        - *_cum_usd: sum over tranches of the cumulative issued / redeemed /
+          inflation-adjustment amounts. Monthly flows are derived from these
+          in compute_bridge.
         """
         print("Collapsing reopenings...")
-        df = df.copy()
-        
-        # Add period columns for flow calculations
-        df['year_month'] = df['record_date'].dt.to_period('M')
-        df['issue_year_month'] = df['issue_date'].dt.to_period('M')
-        
-        def aggregate_security(group):
-            """Aggregate multiple records for the same CUSIP on the same date"""
-            record_ym = group['year_month'].iloc[0]
-            
-            # Issues this month only (for flow calculation)
-            current_month_issues = group[group['issue_year_month'] == record_ym]
-            
-            return pd.Series({
-                # Stock variables (point-in-time). Only one row per CUSIP
-                # carries outstanding_amt; max() skips the null tranche rows.
-                'par_outstanding_usd': group['outstanding_amt'].max(),
-                
-                # Cumulative variables (for bridge calculation)
-                'issued_cum_usd': group['issued_amt'].sum(),
-                'redeemed_cum_usd': group['redeemed_amt'].sum(),  # This is cumulative redemptions
-                'infl_adj_cum_usd': group['inflation_adj_amt'].sum(),
-                
-                # Monthly flow (issuance this month only)
-                'issued_flow_usd': current_month_issues['issued_amt'].sum() if len(current_month_issues) > 0 else 0,
-                
-                # Metadata
-                'instrument_group': group['security_class1_desc'].iloc[0],
-                'security_type': group['security_type_desc'].iloc[0],
-                'orig_issue_date': group['issue_date'].min(),
-                'last_issue_date': group['issue_date'].max(),
-                'reopen_count': max(0, group['issue_date'].nunique() - 1),
-            })
-        
         grouped = df.groupby(
-            ['record_date', 'CUSIP', 'maturity_date'], 
-            as_index=False
-        ).apply(aggregate_security, include_groups=False).reset_index()
-        
-        # Clean up the index columns
-        if 'level_0' in grouped.columns:
-            grouped = grouped.drop(columns=['level_0'])
-        if 'level_3' in grouped.columns:
-            grouped = grouped.drop(columns=['level_3'])
+            ['record_date', 'CUSIP', 'maturity_date'], as_index=False
+        ).agg(
+            # Stock variable (point-in-time)
+            par_outstanding_usd=('outstanding_amt', 'max'),
+            
+            # Cumulative variables (for flow and bridge calculation).
+            # MSPD reports redeemed_amt as a NEGATIVE number, so per CUSIP
+            # outstanding = issued_cum + infl_adj_cum + redeemed_cum.
+            issued_cum_usd=('issued_amt', 'sum'),
+            redeemed_cum_usd=('redeemed_amt', 'sum'),
+            infl_adj_cum_usd=('inflation_adj_amt', 'sum'),
+            
+            # Metadata
+            instrument_group=('security_class1_desc', 'first'),
+            security_type=('security_type_desc', 'first'),
+            orig_issue_date=('issue_date', 'min'),
+            last_issue_date=('issue_date', 'max'),
+            n_issue_dates=('issue_date', 'nunique'),
+        )
+        grouped['reopen_count'] = (grouped.pop('n_issue_dates') - 1).clip(lower=0)
         
         print(f"  Collapsed to {len(grouped):,} records")
         return grouped
@@ -335,43 +313,107 @@ class DataTransformer:
     @staticmethod
     def compute_bridge(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute stock-flow bridge for reconciliation.
+        Compute monthly flows and the stock-flow bridge for each CUSIP.
         
-        IMPROVED LOGIC:
-        Bridge equation: Δ Stock = Issued Flow + Inflation Adj + Redeemed Flow
-        Where:
-        - Δ Stock = par_outstanding(t) - par_outstanding(t-1)
-        - Issued Flow = new issuance this period
-        - Inflation Adj = TIPS adjustment
-        - Redeemed Flow = Δ cumulative redemptions (negative)
+        Flows between consecutive snapshots t-1 and t:
+        - issued_flow_usd   = Δ cumulative issued amount. This captures both
+          reopening tranches (listed as separate rows since ~2014) and older
+          reopenings that MSPD recorded by updating the original row in place.
+        - infl_adj_usd      = Δ cumulative TIPS inflation adjustment
+        - redeemed_flow_usd = -Δ cumulative redeemed (positive = outflow;
+          buybacks and other early redemptions)
+        - matured_usd       = par at t-1 of a CUSIP that has left the
+          snapshot at t (it matured between the two snapshots)
+        
+        A CUSIP's first snapshot starts from zero (it did not exist at t-1).
+        Matured CUSIPs get an "exit row" at t with par_outstanding_usd = 0,
+        is_outstanding = False and matured_usd = prior par, so flow sums by
+        tenor / instrument include maturities. Snapshot analytics must use
+        is_outstanding rows only.
+        
+        Bridge: Δ par = issued + infl_adj - redeemed - matured, and
+        bridge_error_usd = Δ par - that sum. Flows for the first snapshot
+        date are NaN (there is no prior snapshot).
         """
         print("Computing stock-flow bridge...")
         df = df.copy()
-        df = df.sort_values(['CUSIP', 'record_date'])
+        df['is_outstanding'] = True
         
-        # Compute lagged values per CUSIP
-        df['prev_par_outstanding'] = df.groupby('CUSIP')['par_outstanding_usd'].shift(1)
-        df['prev_redeemed_cum'] = df.groupby('CUSIP')['redeemed_cum_usd'].shift(1)
-        df['prev_infl_adj_cum'] = df.groupby('CUSIP')['infl_adj_cum_usd'].shift(1)
+        dates = sorted(df['record_date'].unique())
+        prev_of = dict(zip(dates[1:], dates[:-1]))
+        next_of = dict(zip(dates[:-1], dates[1:]))
+        first_date = dates[0]
         
-        # Stock change
-        df['delta_stock'] = df['par_outstanding_usd'] - df['prev_par_outstanding']
+        # Prior-snapshot values, matched on the previous record date
+        prev = df[['record_date', 'CUSIP', 'par_outstanding_usd', 'issued_cum_usd',
+                   'redeemed_cum_usd', 'infl_adj_cum_usd']].rename(columns={
+            'record_date': 'prev_date',
+            'par_outstanding_usd': 'prev_par_outstanding',
+            'issued_cum_usd': 'prev_issued_cum',
+            'redeemed_cum_usd': 'prev_redeemed_cum',
+            'infl_adj_cum_usd': 'prev_infl_adj_cum',
+        })
+        df['prev_date'] = df['record_date'].map(prev_of)
+        df = df.merge(prev, on=['prev_date', 'CUSIP'], how='left')
         
-        # Flow calculations
-        # Redemption flow is CHANGE in cumulative redemptions (positive value = outflow).
-        # First-period records (prev = NaN) are left as NaN — filling with 0 would
-        # incorrectly treat the entire prior cumulative redemption balance as a
-        # single-period flow.
-        df['redeemed_flow_usd'] = df['redeemed_cum_usd'] - df['prev_redeemed_cum']
-
-        # Inflation adjustment flow
+        # New CUSIPs did not exist at t-1: their prior values are zero, not NaN
+        prev_cols = ['prev_par_outstanding', 'prev_issued_cum',
+                     'prev_redeemed_cum', 'prev_infl_adj_cum']
+        is_new = df['prev_par_outstanding'].isna() & (df['record_date'] != first_date)
+        df.loc[is_new, prev_cols] = 0.0
+        
+        df['issued_flow_usd'] = df['issued_cum_usd'] - df['prev_issued_cum']
         df['infl_adj_usd'] = df['infl_adj_cum_usd'] - df['prev_infl_adj_cum']
-
-        # Bridge: sum of flows should equal stock change.
-        # Redemptions reduce outstanding, so redeemed_flow_usd is subtracted.
-        df['flow_sum'] = df['issued_flow_usd'] + df['infl_adj_usd'] - df['redeemed_flow_usd']
+        df['redeemed_flow_usd'] = -(df['redeemed_cum_usd'] - df['prev_redeemed_cum'])
+        df['matured_usd'] = np.where(df['record_date'] == first_date, np.nan, 0.0)
         
-        # Bridge error (should be ~0 for clean data)
+        # Exit rows: CUSIPs present at t-1 but gone at t
+        present = df[['record_date', 'CUSIP']].assign(_present=True)
+        exits = df[df['record_date'] != dates[-1]].copy()
+        exits['next_date'] = exits['record_date'].map(next_of)
+        exits = exits.merge(
+            present.rename(columns={'record_date': 'next_date'}),
+            on=['next_date', 'CUSIP'], how='left'
+        )
+        exits = exits[exits['_present'].isna()]
+        exit_rows = pd.DataFrame({
+            'record_date': exits['next_date'].values,
+            'CUSIP': exits['CUSIP'].values,
+            'maturity_date': exits['maturity_date'].values,
+            'par_outstanding_usd': 0.0,
+            'issued_cum_usd': 0.0,
+            'redeemed_cum_usd': 0.0,
+            'infl_adj_cum_usd': 0.0,
+            'instrument_group': exits['instrument_group'].values,
+            'security_type': exits['security_type'].values,
+            'orig_issue_date': exits['orig_issue_date'].values,
+            'last_issue_date': exits['last_issue_date'].values,
+            'reopen_count': exits['reopen_count'].values,
+            'is_outstanding': False,
+            'prev_date': exits['record_date'].values,
+            'prev_par_outstanding': exits['par_outstanding_usd'].values,
+            'prev_issued_cum': exits['issued_cum_usd'].values,
+            'prev_redeemed_cum': exits['redeemed_cum_usd'].values,
+            'prev_infl_adj_cum': exits['infl_adj_cum_usd'].values,
+            'issued_flow_usd': 0.0,
+            'infl_adj_usd': 0.0,
+            'redeemed_flow_usd': 0.0,
+            'matured_usd': exits['par_outstanding_usd'].values,
+        })
+        n_early = int((exits['maturity_date'] > exits['next_date']).sum())
+        print(f"  Matured CUSIPs (exit rows): {len(exit_rows):,}")
+        if n_early:
+            print(f"  WARNING: {n_early} CUSIPs left the snapshot before their maturity date")
+        
+        df = pd.concat([df, exit_rows], ignore_index=True)
+        df = df.sort_values(['CUSIP', 'record_date']).reset_index(drop=True)
+        
+        # Bridge: sum of flows should equal the stock change
+        df['delta_stock'] = df['par_outstanding_usd'] - df['prev_par_outstanding']
+        df['flow_sum'] = (
+            df['issued_flow_usd'] + df['infl_adj_usd']
+            - df['redeemed_flow_usd'] - df['matured_usd']
+        )
         df['bridge_error_usd'] = df['delta_stock'] - df['flow_sum']
         df['bridge_error_pct'] = np.where(
             df['par_outstanding_usd'].abs() > 0,
@@ -399,10 +441,12 @@ class DataTransformer:
         )
         df['issue_year'] = df['orig_issue_date'].dt.year
         
-        # Net issuance (for a period).
-        # Redemptions reduce outstanding, so redeemed_flow_usd is subtracted.
+        # Net issuance (for a period): gross issuance plus TIPS accrual, less
+        # buybacks/early redemptions and maturities. Equals the change in
+        # outstanding par up to the bridge error.
         df['net_issuance_usd'] = (
-            df['issued_flow_usd'] + df['infl_adj_usd'] - df['redeemed_flow_usd']
+            df['issued_flow_usd'] + df['infl_adj_usd']
+            - df['redeemed_flow_usd'] - df['matured_usd']
         )
         
         # Maturity bucket classification
@@ -473,8 +517,22 @@ def run_full_pipeline(use_cache: bool = True) -> pd.DataFrame:
     print(f"  Parquet: {parquet_path}")
     print(f"  CSV: {csv_path}")
     
+    # Monthly stock-flow reconciliation
+    from analytics import PortfolioAnalytics
+    recon = PortfolioAnalytics(final_df).compute_reconciliation()
+    recon_path = CONFIG.data_dir / "reconciliation.csv"
+    recon.to_csv(recon_path)
+    print(f"  Reconciliation: {recon_path}")
+    print("\nStock-flow reconciliation, last 6 months ($bn):")
+    cols = ['delta_stock', 'gross_issued', 'matured', 'redeemed',
+            'infl_adj', 'net_issuance', 'residual']
+    print((recon[cols].tail(6) / 1e9).round(1).to_string())
+    
     # Print summary
-    latest = final_df[final_df['record_date'] == final_df['record_date'].max()]
+    latest = final_df[
+        (final_df['record_date'] == final_df['record_date'].max()) &
+        final_df['is_outstanding']
+    ]
     print(f"\nLatest snapshot ({latest['record_date'].iloc[0].date()}):")
     print(f"  Total Outstanding: ${latest['par_outstanding_usd'].sum()/1e12:.2f}T")
     print(f"  Number of CUSIPs: {latest['CUSIP'].nunique():,}")

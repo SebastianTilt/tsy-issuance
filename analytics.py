@@ -50,17 +50,23 @@ class PortfolioAnalytics:
         """Validate required columns exist"""
         required_cols = [
             'record_date', 'CUSIP', 'par_outstanding_usd', 
-            'years_to_maturity', 'maturity_bucket', 'instrument_group'
+            'years_to_maturity', 'maturity_bucket', 'instrument_group',
+            'is_outstanding',
         ]
         missing = [c for c in required_cols if c not in self.df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
     
     def get_snapshot(self, date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-        """Get portfolio snapshot for a specific date (default: latest)"""
+        """
+        Get portfolio snapshot for a specific date (default: latest).
+        
+        Excludes the exit rows that record maturities (is_outstanding False).
+        """
         if date is None:
             date = self.df['record_date'].max()
-        return self.df[self.df['record_date'] == date].copy()
+        mask = (self.df['record_date'] == date) & self.df['is_outstanding']
+        return self.df[mask].copy()
     
     def compute_portfolio_metrics(
         self, 
@@ -176,9 +182,12 @@ class PortfolioAnalytics:
             values='wam'
         )
     
-    def compute_net_issuance_by_bucket(self, freq: str = 'M') -> pd.DataFrame:
+    def compute_net_issuance_by_tenor(self, freq: str = 'M') -> pd.DataFrame:
         """
         Compute net issuance by original tenor program at specified frequency.
+        
+        Net issuance = gross issuance + TIPS accrual - buybacks/early
+        redemptions - maturities.
 
         Flows are grouped by orig_tenor_program (the tenor at which each security
         was originally issued) rather than by remaining maturity_bucket.  Using
@@ -199,13 +208,14 @@ class PortfolioAnalytics:
             'issued_flow_usd': 'sum',
             'redeemed_flow_usd': 'sum',
             'infl_adj_usd': 'sum',
+            'matured_usd': 'sum',
         }).reset_index()
 
-        # Redemptions reduce outstanding, so redeemed_flow_usd is subtracted.
         flows['net_issuance'] = (
             flows['issued_flow_usd'] +
             flows['infl_adj_usd'] -
-            flows['redeemed_flow_usd']
+            flows['redeemed_flow_usd'] -
+            flows['matured_usd']
         )
 
         pivot = flows.pivot(
@@ -355,16 +365,46 @@ class PortfolioAnalytics:
 
         return pd.DataFrame(results)
 
+    def compute_reconciliation(self) -> pd.DataFrame:
+        """
+        Monthly stock-flow reconciliation of total marketable debt.
+        
+        delta_stock (change in total par outstanding) is compared with net
+        issuance built up from the flows; residual = delta_stock - net.
+        Bills issued and matured inside the same month never appear in a
+        month-end snapshot. They are missing from gross issuance and from
+        maturities alike, so they cannot create a residual.
+        """
+        df = self.df
+        monthly = df.groupby('record_date').agg(
+            total_outstanding=('par_outstanding_usd', 'sum'),
+            gross_issued=('issued_flow_usd', 'sum'),
+            infl_adj=('infl_adj_usd', 'sum'),
+            redeemed=('redeemed_flow_usd', 'sum'),
+            matured=('matured_usd', 'sum'),
+        )
+        monthly['net_issuance'] = (
+            monthly['gross_issued'] + monthly['infl_adj']
+            - monthly['redeemed'] - monthly['matured']
+        )
+        monthly['delta_stock'] = monthly['total_outstanding'].diff()
+        monthly['residual'] = monthly['delta_stock'] - monthly['net_issuance']
+        # No flows exist for the first snapshot
+        monthly = monthly.iloc[1:]
+        return monthly
+    
     def compute_bridge_diagnostics(self) -> Dict[str, pd.DataFrame]:
         """Compute bridge error diagnostics"""
         df = self.df[self.df['bridge_error_usd'].notna()].copy()
+        df['bridge_error_abs'] = df['bridge_error_usd'].abs()
         
         # Summary by date
         by_date = df.groupby('record_date').agg({
             'bridge_error_usd': ['sum', 'mean', 'std'],
+            'bridge_error_abs': 'sum',
             'par_outstanding_usd': 'sum',
         })
-        by_date.columns = ['error_sum', 'error_mean', 'error_std', 'total_par']
+        by_date.columns = ['error_sum', 'error_mean', 'error_std', 'error_abs', 'total_par']
         by_date['error_pct'] = by_date['error_sum'] / by_date['total_par'] * 100
         
         # Large errors
