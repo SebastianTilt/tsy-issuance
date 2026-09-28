@@ -471,10 +471,10 @@ class DataTransformer:
         
         df['orig_tenor_program'] = df['orig_tenor_years'].apply(classify_tenor_program)
         
-        # Security type flags
-        df['is_bill'] = df['instrument_group'].str.contains('Bill', case=False, na=False)
-        df['is_tips'] = df['instrument_group'].str.contains('TIPS', case=False, na=False)
-        df['is_frn'] = df['instrument_group'].str.contains('FRN', case=False, na=False)
+        # Security type flags (exact security_class1_desc values used by MSPD)
+        df['is_bill'] = df['instrument_group'] == 'Bills Maturity Value'
+        df['is_tips'] = df['instrument_group'] == 'Inflation-Protected Securities'
+        df['is_frn'] = df['instrument_group'] == 'Floating Rate Notes'
         
         # Year-month for aggregation
         df['year_month'] = df['record_date'].dt.to_period('M')
